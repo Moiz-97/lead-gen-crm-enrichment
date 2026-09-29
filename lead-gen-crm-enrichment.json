@@ -1,0 +1,284 @@
+{
+  "name": "Lead Gen & CRM Enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Lead Gen & CRM Enrichment\n**Setup (5 min):**\n1. Clearbit node: `YOUR_CLEARBIT_API_KEY` replace karo (ya Apollo/Hunter ka URL lagao)\n2. Google Sheets: credential + Sheet select karo. Headers: Date, Name, Email, Phone, Company, Title, Industry, Employees, LinkedIn, Country, Source, Message, Score, Tier, Enriched\n3. Slack / Telegram: credential + channel/chat ID daalo (jo na chahiye use delete karo)\n4. Webhook ka Production URL apni form / Facebook / LinkedIn integration me lagao\n5. Workflow ko Active karo",
+        "height": 300,
+        "width": 620
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "5c0f8c3e-7a51-4b1e-9f6d-2b7d1e0c4a11"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = ($json.body && typeof $json.body === 'object') ? $json.body : $json;\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    if (raw[k] !== undefined && raw[k] !== null && String(raw[k]).trim() !== '') {\n      return String(raw[k]).trim();\n    }\n  }\n  return '';\n};\n\nconst email = pick('email', 'work_email', 'Email').toLowerCase();\nif (!email || !email.includes('@')) {\n  throw new Error('Valid email missing in form submission');\n}\n\nconst name = pick('name', 'full_name', 'fullName', 'Name') ||\n  [pick('first_name', 'firstName'), pick('last_name', 'lastName')].filter(Boolean).join(' ');\n\nconst domain = email.split('@')[1];\nconst freeDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com', 'icloud.com', 'proton.me', 'protonmail.com'];\n\nreturn {\n  json: {\n    name,\n    email,\n    phone: pick('phone', 'phone_number', 'Phone'),\n    company: pick('company', 'company_name', 'Company'),\n    message: pick('message', 'Message', 'notes'),\n    source: pick('source', 'utm_source', 'platform') || 'website',\n    domain,\n    isFreeEmail: freeDomains.includes(domain),\n    receivedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Normalize Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://person.clearbit.com/v2/combined/find?email={{ encodeURIComponent($json.email) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_CLEARBIT_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Clearbit Enrich",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let lead;\ntry {\n  lead = $('Normalize Lead').item.json;\n} catch (err) {\n  lead = $('Normalize Lead').first().json;\n}\n\nconst enrich = $json || {};\nconst person = enrich.person || {};\nconst company = enrich.company || {};\nconst employment = person.employment || {};\nconst title = employment.title || '';\nconst seniority = employment.seniority || '';\nconst employees = (company.metrics && company.metrics.employees) || 0;\nconst enriched = !!(person.id || company.id);\n\n// ---- Lead scoring ----\nlet score = 0;\nif (!lead.isFreeEmail) score += 20;                       // business email\nif (lead.phone) score += 10;                              // phone diya\nif (lead.message && lead.message.length > 50) score += 10; // detailed message\nif (company.name || lead.company) score += 10;            // company known\nif (/\\b(budget|quote|pricing|proposal|hire|urgent|asap|project|website|app|automation|erp|crm)\\b/i.test(lead.message || '')) score += 15; // buying intent\nif (employees >= 50) score += 20; else if (employees >= 10) score += 10; // company size\nif (/executive|director|vp/i.test(seniority) || /ceo|founder|owner|cto|coo|head|director|vp/i.test(title)) score += 30; // decision maker\nscore = Math.min(score, 100);\n\nconst HOT = 60;   // <-- threshold yahan change karo\nconst WARM = 35;\nconst tier = score >= HOT ? 'HOT' : (score >= WARM ? 'WARM' : 'COLD');\n\nreturn {\n  json: {\n    ...lead,\n    companyName: company.name || lead.company || '',\n    industry: (company.category && company.category.industry) || '',\n    employees,\n    title,\n    seniority,\n    linkedin: (person.linkedin && person.linkedin.handle) ? 'https://linkedin.com/' + person.linkedin.handle : '',\n    country: (company.geo && company.geo.country) || (person.geo && person.geo.country) || '',\n    enriched,\n    score,\n    tier,\n    isHighValue: score >= HOT\n  }\n};"
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Score & Merge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date": "={{ $now.toFormat('yyyy-MM-dd HH:mm') }}",
+            "Name": "={{ $json.name }}",
+            "Email": "={{ $json.email }}",
+            "Phone": "={{ $json.phone }}",
+            "Company": "={{ $json.companyName }}",
+            "Title": "={{ $json.title }}",
+            "Industry": "={{ $json.industry }}",
+            "Employees": "={{ $json.employees }}",
+            "LinkedIn": "={{ $json.linkedin }}",
+            "Country": "={{ $json.country }}",
+            "Source": "={{ $json.source }}",
+            "Message": "={{ $json.message }}",
+            "Score": "={{ $json.score }}",
+            "Tier": "={{ $json.tier }}",
+            "Enriched": "={{ $json.enriched }}"
+          },
+          "matchingColumns": [
+            "Email"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Save to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        900,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.isHighValue }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "High Value Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "YOUR_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "=🔥 *{{ $json.tier }} LEAD* ({{ $json.score }}/100)\n*Name:* {{ $json.name }}\n*Email:* {{ $json.email }}\n*Phone:* {{ $json.phone || 'N/A' }}\n*Company:* {{ $json.companyName || 'N/A' }} ({{ $json.employees || '?' }} employees)\n*Title:* {{ $json.title || 'N/A' }}\n*LinkedIn:* {{ $json.linkedin || 'N/A' }}\n*Source:* {{ $json.source }}\n*Message:* {{ $json.message || '-' }}",
+        "otherOptions": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1140,
+        340
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🔥 {{ $json.tier }} LEAD ({{ $json.score }}/100)\nName: {{ $json.name }}\nEmail: {{ $json.email }}\nPhone: {{ $json.phone || 'N/A' }}\nCompany: {{ $json.companyName || 'N/A' }} ({{ $json.employees || '?' }} employees)\nTitle: {{ $json.title || 'N/A' }}\nLinkedIn: {{ $json.linkedin || 'N/A' }}\nSource: {{ $json.source }}\nMessage: {{ $json.message || '-' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1140,
+        520
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Lead": {
+      "main": [
+        [
+          {
+            "node": "Clearbit Enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clearbit Enrich": {
+      "main": [
+        [
+          {
+            "node": "Score & Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & Merge": {
+      "main": [
+        [
+          {
+            "node": "Save to Google Sheets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Value Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Value Lead?": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
